@@ -5,9 +5,11 @@
 
 """Checkpoint manager extension with NPU-aware save and hash verification."""
 
+import os
+
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.distributed.checkpoint as dcp
@@ -15,6 +17,7 @@ import torchtitan.components.checkpoint
 from torch.distributed.checkpoint.state_dict_saver import AsyncSaveResponse
 from torchtitan.components.checkpoint import (
     AsyncMode,
+    MODEL,
 )
 from torchtitan.components.checkpoint import (
     CheckpointManager as _CheckpointManager,
@@ -32,6 +35,8 @@ from torchtitan_npu.extensions.components.validation import (
 @dataclass(kw_only=True, slots=True)
 class CheckpointExtensions:
     verify_hash_manifest: bool = False
+    dcp_read_mode: Literal["default", "mmap"] = "default"
+    """Local DCP tensor read mode. ``mmap`` requires the paired PyTorch branch."""
     """
     ``verify_hash_manifest`` enables per-file SHA-256 integrity verification.
     On save, a ``_checkpoint_hash_manifest.json`` is written containing the
@@ -66,6 +71,9 @@ class CheckpointManager(_CheckpointManager):
             )
 
         self.verify_hash_manifest = config.extensions.verify_hash_manifest
+        self.dcp_read_mode = config.extensions.dcp_read_mode
+        if self.dcp_read_mode not in ("default", "mmap"):
+            raise ValueError(f"invalid dcp_read_mode: {self.dcp_read_mode!r}")
         super().__init__(config=config, **kwargs)
 
     @torch.no_grad()
@@ -114,12 +122,23 @@ class CheckpointManager(_CheckpointManager):
         if self.verify_hash_manifest:
             verify_checkpoint_manifest(checkpoint_id)
 
-        return super().dcp_load(
-            state_dict,
-            checkpoint_id,
-            from_hf,
-            from_quantized,
-        )
+        is_local_dcp = not from_hf and "://" not in os.fspath(checkpoint_id)
+        if self.dcp_read_mode == "default" or not is_local_dcp:
+            return super().dcp_load(
+                state_dict, checkpoint_id, from_hf, from_quantized
+            )
+
+        try:
+            reader = dcp.FileSystemReader(checkpoint_id, mmap=True)
+        except TypeError as error:
+            raise RuntimeError(
+                "dcp_read_mode='mmap' requires the paired PyTorch experiment "
+                "at a5e8f1d2b036ded1688e5c3cfae5b5e3247528ba or later"
+            ) from error
+        dcp.load(state_dict, storage_reader=reader)
+        if MODEL in self.states:
+            self.states[MODEL].load_state_dict(state_dict)
+        return None
 
 
 torchtitan.components.checkpoint.CheckpointManager = CheckpointManager
